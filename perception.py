@@ -127,6 +127,7 @@ class PredatorClassifierNode(Node):
         self.img_size = (64, 64)  # same as training
 
         self.get_logger().info("Predator classifier node started.")
+        self.image_callback_result = None
 
     def preprocess(self, cv_image):
         # Resize, normalize etc.
@@ -157,6 +158,7 @@ class PredatorClassifierNode(Node):
 
         # Log or publish result
         self.get_logger().info(f"Predator probability: {prob:.3f} => {'Predator' if is_predator else 'Not Predator'}")
+        self.image_callback_result = is_predator
 
 def main(args=None):
     rclpy.init(args=args)
