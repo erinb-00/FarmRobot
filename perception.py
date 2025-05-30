@@ -18,14 +18,14 @@ import cv2
 IMG_SIZE = (64, 64)  # Resize images as needed
 BATCH_SIZE = 32
 
-# Paths to datasets you downloaded locally after Kaggle download
-CIFAR_REFINED_PATH = './cifar'  # Replace with actual path
-RODENTS_PATH = './rodents'  # Replace with actual path
+# # Paths to datasets you downloaded locally after Kaggle download
+# CIFAR_REFINED_PATH = './cifar'  # Replace with actual path
+# RODENTS_PATH = './rodents'  # Replace with actual path
 
-import tensorflow as tf
-import numpy as np
-import os
-from PIL import Image
+# import tensorflow as tf
+# import numpy as np
+# import os
+# from PIL import Image
 from sklearn.model_selection import train_test_split
 
 # Parameters
@@ -47,27 +47,56 @@ x_train_cifar_resized = tf.image.resize(x_train_cifar, [IMG_SIZE, IMG_SIZE]).num
 x_test_cifar_resized = tf.image.resize(x_test_cifar, [IMG_SIZE, IMG_SIZE]).numpy()
 
 # Load rodents images from folder - replace the path with your rodents dataset folder path
-rodents_folder = './rodents'
+rodents_folder = '/content/rodents'
 classes_rodents = ['rat', 'mouse', 'shrew']  # Example rodent classes you have
 rodent_images = []
 rodent_labels = []
 
+# def load_rodent_images(folder, classes, img_size):
+#     images = []
+#     labels = []
+#     for idx, cls in enumerate(classes):
+#         cls_folder = os.path.join(folder, cls)
+#         if not os.path.exists(cls_folder):
+#             continue
+#         for file in os.listdir(cls_folder):
+#             path = os.path.join(cls_folder, file)
+#             try:
+#                 img = Image.open(path).convert('RGB').resize((img_size, img_size))
+#                 images.append(np.array(img))
+#                 labels.append(0)  # rodents = non-predators class 0
+#             except:
+#                 continue
+#     return np.array(images), np.array(labels)
+
+# Updated class names to match folder names
+classes_rodents = ['Mice', 'Rats', 'Shrew']
+
 def load_rodent_images(folder, classes, img_size):
     images = []
     labels = []
-    for idx, cls in enumerate(classes):
+    for cls in classes:
         cls_folder = os.path.join(folder, cls)
+        print(f"Looking in folder: {cls_folder}")
         if not os.path.exists(cls_folder):
+            print(f"Folder does not exist: {cls_folder}")
             continue
         for file in os.listdir(cls_folder):
             path = os.path.join(cls_folder, file)
             try:
                 img = Image.open(path).convert('RGB').resize((img_size, img_size))
                 images.append(np.array(img))
-                labels.append(0)  # rodents = non-predators class 0
-            except:
-                continue
-    return np.array(images), np.array(labels)
+                labels.append(0)  # All rodents = non-predators = class 0
+            except Exception as e:
+                print(f"Failed to load {path}: {e}")
+    if not images:
+        print("No images loaded. Check your paths and image files.")
+        return np.empty((0, img_size, img_size, 3)), np.empty((0,))
+    return np.stack(images), np.array(labels)
+
+x_rodents, y_rodents = load_rodent_images(rodents_folder, classes_rodents, IMG_SIZE)
+print(f"Rodent image tensor shape: {x_rodents.shape}")
+print(f"Rodent label array shape: {y_rodents.shape}")
 
 x_rodents, y_rodents = load_rodent_images(rodents_folder, classes_rodents, IMG_SIZE)
 
@@ -155,7 +184,7 @@ val_generator = ImageDataGenerator().flow(x_val, y_val, batch_size=BATCH_SIZE)
 # Define or import your CNN or ViT model here
 # For example, a simple CNN:
 model = tf.keras.Sequential([
-    tf.keras.layers.InputLayer(input_shape=IMG_SIZE+(3,)),
+    tf.keras.layers.InputLayer(input_shape=(IMG_SIZE, IMG_SIZE, 3)),
     tf.keras.layers.Conv2D(32, (3,3), activation='relu'),
     tf.keras.layers.MaxPooling2D(),
     tf.keras.layers.Conv2D(64, (3,3), activation='relu'),
@@ -164,6 +193,7 @@ model = tf.keras.Sequential([
     tf.keras.layers.Dense(128, activation='relu'),
     tf.keras.layers.Dense(1, activation='sigmoid')
 ])
+
 model.compile(optimizer='adam', loss='binary_crossentropy', metrics=['accuracy'])
 
 # Train the model
