@@ -8,9 +8,10 @@ from sklearn.model_selection import train_test_split
 from PIL import Image
 import rclpy
 from rclpy.node import Node
-from sensor_msgs.msg import Image
+from sensor_msgs.msg import Image, CameraInfo
 from cv_bridge import CvBridge
 import cv2
+import message_filters
 # import numpy as np
 # import tensorflow as tf
 
@@ -47,7 +48,7 @@ x_train_cifar_resized = tf.image.resize(x_train_cifar, [IMG_SIZE, IMG_SIZE]).num
 x_test_cifar_resized = tf.image.resize(x_test_cifar, [IMG_SIZE, IMG_SIZE]).numpy()
 
 # Load rodents images from folder - replace the path with your rodents dataset folder path
-rodents_folder = '/content/rodents'
+rodents_folder = '/content/rodents' #change file path accordingly
 classes_rodents = ['rat', 'mouse', 'shrew']  # Example rodent classes you have
 rodent_images = []
 rodent_labels = []
@@ -86,7 +87,7 @@ def load_rodent_images(folder, classes, img_size):
             try:
                 img = Image.open(path).convert('RGB').resize((img_size, img_size))
                 images.append(np.array(img))
-                labels.append(0)  # All rodents = non-predators = class 0
+                labels.append(1)  # All rodents = non-predators = class 0
             except Exception as e:
                 print(f"Failed to load {path}: {e}")
     if not images:
@@ -206,20 +207,38 @@ class PredatorClassifierNode(Node):
     def __init__(self):
         super().__init__('predator_classifier_node')
         self.bridge = CvBridge()
-        self.subscription = self.create_subscription(
-            Image,
-            '/camera/color/image_raw', 
-            self.image_callback,
-            10)
-        self.subscription  # prevent unused variable warning
+        # self.subscription = self.create_subscription(
+        #     Image,
+        #     '/camera/color/image_raw', 
+        #     self.image_callback,
+        #     10)
+        # self.subscription  # prevent unused variable warning
+        
+        # self.depth_subscription = self.create_subscription(
+        #     Image,
+        #     '/camera/depth/image_raw', 
+        #     self.image_callback_depth,
+        #     10)
 
-        # Load model
-        self.model = tf.keras.models.load_model('predator_classifier_model.h5')
+        # # Load model
+        # self.model = tf.keras.models.load_model('predator_classifier_model_rodents_pred.h5')
 
-        # Expected input size
-        self.img_size = (64, 64)  # same as training
+        # # Expected input size
+        # self.img_size = (64, 64)  # same as training
 
+        # self.get_logger().info("Predator classifier node started.")
+         # Load model
+        self.model = tf.keras.models.load_model('predator_classifier_model_rodents_pred.h5')
         self.get_logger().info("Predator classifier node started.")
+
+        # Sync RGB and depth messages
+        self.rgb_sub = message_filters.Subscriber(self, Image, '/camera/color/image_raw')
+        self.depth_sub = message_filters.Subscriber(self, Image, '/camera/depth/image_raw')
+
+        # Time synchronizer
+        ts = message_filters.ApproximateTimeSynchronizer(
+            [self.rgb_sub, self.depth_sub], queue_size=10, slop=0.1)
+        ts.registerCallback(self.synced_callback)
 
     def preprocess(self, cv_image):
         # Resize, normalize etc.
@@ -227,29 +246,76 @@ class PredatorClassifierNode(Node):
         img = img.astype('float32') / 255.0
         img = np.expand_dims(img, axis=0)  # batch size 1
         return img
-
-    def image_callback(self, msg):
+    
+    def synced_callback(self, rgb_msg, depth_msg):
         try:
-            # Convert ROS Image message to OpenCV image (BGR)
-            cv_image_bgr = self.bridge.imgmsg_to_cv2(msg, desired_encoding='bgr8')
-            # Convert BGR to RGB as model was trained on RGB images
-            cv_image_rgb = cv2.cvtColor(cv_image_bgr, cv2.COLOR_BGR2RGB)
+            cv_rgb = self.bridge.imgmsg_to_cv2(rgb_msg, desired_encoding='bgr8')
+            cv_rgb = cv2.cvtColor(cv_rgb, cv2.COLOR_BGR2RGB)
+
+            cv_depth = self.bridge.imgmsg_to_cv2(depth_msg, desired_encoding='passthrough')  # usually 32FC1
         except Exception as e:
             self.get_logger().error(f"CV bridge error: {e}")
             return
 
-        # Preprocess image
-        input_img = self.preprocess(cv_image_rgb)
-
-        # Predict
+        # Run classifier
+        input_img = self.preprocess(cv_rgb)
         pred = self.model.predict(input_img)
-        prob = pred[0][0]  # sigmoid output probability
-
-        # Assuming threshold 0.5
+        prob = pred[0][0]
         is_predator = prob > 0.5
 
-        # Log or publish result
-        self.get_logger().info(f"Predator probability: {prob:.3f} => {'Predator' if is_predator else 'Not Predator'}")
+        if is_predator:
+            cx, cy = self.estimate_intruder_position(cv_rgb)
+            if cx == -1:
+                self.get_logger().warn("Could not locate intruder in image.")
+                return
+
+            # Get depth at (cx, cy)
+            depth = cv_depth[cy, cx]
+            if np.isnan(depth) or depth == 0:
+                self.get_logger().warn(f"Invalid depth at ({cx},{cy})")
+                return
+
+            # Estimate 3D position from depth
+            x, y, z = self.project_to_3d(cx, cy, depth)
+            self.get_logger().info(f"Predator at image ({cx}, {cy}), 3D position (x={x:.2f}, y={y:.2f}, z={z:.2f}) prob={prob:.2f}")
+            return x, y, z
+        else:
+            self.get_logger().info(f"Not Predator (prob={prob:.2f})")
+
+    def project_to_3d(self, u, v, depth):
+        # Camera intrinsics (replace with actual values from /camera/color/camera_info)
+        fx = 600  # focal length in pixels
+        fy = 600
+        cx = 320  # principal point
+        cy = 240
+
+        x = (u - cx) * depth / fx
+        y = (v - cy) * depth / fy
+        z = depth
+        return x, y, z
+
+    # def image_callback(self, msg):
+    #     try:
+    #         # Convert ROS Image message to OpenCV image (BGR)
+    #         cv_image_bgr = self.bridge.imgmsg_to_cv2(msg, desired_encoding='bgr8')
+    #         # Convert BGR to RGB as model was trained on RGB images
+    #         cv_image_rgb = cv2.cvtColor(cv_image_bgr, cv2.COLOR_BGR2RGB)
+    #     except Exception as e:
+    #         self.get_logger().error(f"CV bridge error: {e}")
+    #         return
+
+    #     # Preprocess image
+    #     input_img = self.preprocess(cv_image_rgb)
+
+    #     # Predict
+    #     pred = self.model.predict(input_img)
+    #     prob = pred[0][0]  # sigmoid output probability
+
+    #     # Assuming threshold 0.5
+    #     is_predator = prob > 0.5
+
+    #     # Log or publish result
+    #     self.get_logger().info(f"Predator probability: {prob:.3f} => {'Predator' if is_predator else 'Not Predator'}")
         
         # # Display text on image (using BGR version for display)
         # display_text = f"Predator Prob: {prob:.2f} - {'YES' if is_predator else 'NO'}"
