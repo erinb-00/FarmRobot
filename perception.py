@@ -1,5 +1,5 @@
 import tensorflow as tf
-import pickle
+# import pickle
 import numpy as np
 import pandas as pd
 import os
@@ -16,8 +16,8 @@ import message_filters
 # import tensorflow as tf
 
 # Parameters
-# IMG_SIZE = (64, 64)  # Resize images as needed
-# BATCH_SIZE = 32
+IMG_SIZE = (64, 64)  # Resize images as needed
+BATCH_SIZE = 32
 
 # # # Paths to datasets you downloaded locally after Kaggle download
 # # CIFAR_REFINED_PATH = './cifar'  # Replace with actual path
@@ -223,11 +223,11 @@ class PredatorClassifierNode(Node):
         # # Load model
         # self.model = tf.keras.models.load_model('predator_classifier_model_rodents_pred.h5')
 
-        # # Expected input size
-        # self.img_size = (64, 64)  # same as training
+        # Expected input size
+        self.img_size = (64, 64)  # same as training
 
         # self.get_logger().info("Predator classifier node started.")
-         # Load model
+        # Load model
         self.model = tf.keras.models.load_model('predator_classifier_model_rodents_pred.h5')
         self.get_logger().info("Predator classifier node started.")
 
@@ -246,6 +246,29 @@ class PredatorClassifierNode(Node):
         img = img.astype('float32') / 255.0
         img = np.expand_dims(img, axis=0)  # batch size 1
         return img
+    
+    def estimate_intruder_position(self, image_bgr):
+        """
+        Very basic blob detection using grayscale + thresholding.
+        Returns centroid of the largest contour as intruder position in image space.
+        """
+        gray = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2GRAY)
+        _, thresh = cv2.threshold(gray, 50, 255, cv2.THRESH_BINARY_INV)  # adjust for rodent contrast
+        contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    
+        if not contours:
+            return -1, -1  # No contour found
+    
+        # Assume largest contour is intruder
+        largest_contour = max(contours, key=cv2.contourArea)
+        M = cv2.moments(largest_contour)
+    
+        if M["m00"] == 0:
+            return -1, -1
+    
+        cx = int(M["m10"] / M["m00"])
+        cy = int(M["m01"] / M["m00"])
+        return cx, cy
     
     def synced_callback(self, rgb_msg, depth_msg):
         try:
