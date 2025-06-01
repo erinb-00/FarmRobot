@@ -18,15 +18,19 @@ from typing import Optional, Tuple
 import rclpy
 from rclpy.node import Node
 from rclpy.duration import Duration
-from geometry_msgs.msg import Twist, Pose, Point
+from geometry_msgs.msg import Twist, Pose, Point, TransformStamped
 from sensor_msgs.msg import LaserScan
 from std_srvs.srv import SetBool
+from tf2_ros import TransformBroadcaster
+import tf_transformations
 
 # Constants
 DEFAULT_CMD_VEL_TOPIC = 'cmd_vel'
 DEFAULT_SCAN_TOPIC = 'scan'
 DEFAULT_TARGET_POSE_TOPIC = 'target_pose'
 DEFAULT_SERVICE_NAME = 'chase_on_off'
+DEFAULT_BASE_FRAME = 'base_link'
+DEFAULT_WORLD_FRAME = 'odom'
 
 FREQUENCY = 10  # Hz
 TARGET_DISTANCE = 1.0  # m - desired distance from target
@@ -133,6 +137,9 @@ class ChaseController(Node):
         self._target_sub = self.create_subscription(
             Pose, DEFAULT_TARGET_POSE_TOPIC, self._target_callback, 1)
         
+        # Transform broadcaster for robot pose
+        self._tf_broadcaster = TransformBroadcaster(self)
+        
         # Service for enabling/disabling chase behavior
         self._service = self.create_service(
             SetBool, f'{node_name}/{DEFAULT_SERVICE_NAME}', self._service_callback)
@@ -140,6 +147,14 @@ class ChaseController(Node):
         # State machine
         self._state = ChaseState.STOP
         self._previous_state = ChaseState.STOP
+        
+        # Robot pose tracking
+        self._robot_x = 0.0
+        self._robot_y = 0.0
+        self._robot_theta = 0.0
+        self._last_cmd_time = None
+        self._last_linear_vel = 0.0
+        self._last_angular_vel = 0.0
         
         # Target tracking
         self._target_pose: Optional[Pose] = None
@@ -233,6 +248,12 @@ class ChaseController(Node):
     def _control_loop(self):
         """Main control loop implementing the finite state machine."""
         current_time = self.get_clock().now().nanoseconds / 1e9
+        
+        # Update robot pose based on odometry integration
+        self._update_robot_pose(current_time)
+        
+        # Publish robot transform
+        self._publish_transform()
         
         # State transitions and actions
         if self._state == ChaseState.STOP:
@@ -379,6 +400,10 @@ class ChaseController(Node):
         twist.linear.x = linear
         twist.angular.z = angular
         self._cmd_pub.publish(twist)
+        
+        # Store velocity commands for odometry integration
+        self._last_linear_vel = linear
+        self._last_angular_vel = angular
     
     def _stop_robot(self):
         """Stop the robot."""
@@ -396,6 +421,60 @@ class ChaseController(Node):
             (point1.y - point2.y)**2 + 
             (point1.z - point2.z)**2
         )
+    
+    def _update_robot_pose(self, current_time: float):
+        """Update robot pose using simple odometry integration."""
+        if self._last_cmd_time is None:
+            self._last_cmd_time = current_time
+            return
+        
+        dt = current_time - self._last_cmd_time
+        if dt <= 0.0:
+            return
+        
+        # Simple odometry integration (assumes differential drive)
+        # This is a basic approximation - in a real system you'd use wheel encoders
+        linear_vel = self._last_linear_vel
+        angular_vel = self._last_angular_vel
+        
+        # Update orientation
+        self._robot_theta += angular_vel * dt
+        
+        # Normalize angle to [-pi, pi]
+        while self._robot_theta > math.pi:
+            self._robot_theta -= 2 * math.pi
+        while self._robot_theta < -math.pi:
+            self._robot_theta += 2 * math.pi
+        
+        # Update position
+        self._robot_x += linear_vel * math.cos(self._robot_theta) * dt
+        self._robot_y += linear_vel * math.sin(self._robot_theta) * dt
+        
+        self._last_cmd_time = current_time
+    
+    def _publish_transform(self):
+        """Publish robot transform to /base_link."""
+        transform = TransformStamped()
+        
+        # Header
+        transform.header.stamp = self.get_clock().now().to_msg()
+        transform.header.frame_id = DEFAULT_WORLD_FRAME
+        transform.child_frame_id = DEFAULT_BASE_FRAME
+        
+        # Translation
+        transform.transform.translation.x = self._robot_x
+        transform.transform.translation.y = self._robot_y
+        transform.transform.translation.z = 0.0
+        
+        # Rotation (convert from yaw angle to quaternion)
+        quaternion = tf_transformations.quaternion_from_euler(0, 0, self._robot_theta)
+        transform.transform.rotation.x = quaternion[0]
+        transform.transform.rotation.y = quaternion[1]
+        transform.transform.rotation.z = quaternion[2]
+        transform.transform.rotation.w = quaternion[3]
+        
+        # Broadcast transform
+        self._tf_broadcaster.sendTransform(transform)
 
 
 def main(args=None):
