@@ -17,7 +17,6 @@ import time
 import os
 import threading
 from typing import Optional, Tuple, List
-from collections import deque
 import numpy as np
 
 import rclpy
@@ -25,7 +24,6 @@ from rclpy.node import Node
 from rclpy.duration import Duration
 from geometry_msgs.msg import Twist, Pose, Point, TransformStamped
 from sensor_msgs.msg import LaserScan
-from nav_msgs.msg import OccupancyGrid
 from std_srvs.srv import SetBool
 from std_msgs.msg import String, Bool, Empty
 from tf2_ros import TransformBroadcaster, TransformException
@@ -43,7 +41,7 @@ except ImportError:
 
 # Constants
 DEFAULT_CMD_VEL_TOPIC = 'cmd_vel'
-DEFAULT_SCAN_TOPIC = 'scan'
+DEFAULT_SCAN_TOPIC = 'base_scan'
 DEFAULT_TARGET_POSE_TOPIC = 'target_pose'
 DEFAULT_OCCUPANCY_GRID_TOPIC = 'map'
 DEFAULT_CHASE_ENABLE_TOPIC = 'chase_enable'
@@ -60,12 +58,6 @@ FREQUENCY = 10  # Hz
 TARGET_DISTANCE = 1.0  # m - desired distance from target
 DISTANCE_TOLERANCE = 0.1  # m - tolerance for target distance
 
-# Path planning parameters
-OCCUPANCY_THRESHOLD = 50  # Values above this are considered obstacles (0-100)
-ROBOT_RADIUS = 0.15  # m - robot radius for collision checking (smaller for finer maze)
-PATH_RESOLUTION = 0.05  # m - resolution for path planning (match pa3_cs81 resolution)
-MAX_PLANNING_DISTANCE = 10.0  # m - maximum distance for path planning
-
 # PID gains for linear motion (distance control)
 LINEAR_KP = 1.0
 LINEAR_KI = 0.1
@@ -76,15 +68,6 @@ ANGULAR_KP = 2.0
 ANGULAR_KI = 0.1
 ANGULAR_KD = 0.1
 
-# Path following PID gains
-PATH_LINEAR_KP = 0.8
-PATH_LINEAR_KI = 0.05
-PATH_LINEAR_KD = 0.1
-
-PATH_ANGULAR_KP = 1.5
-PATH_ANGULAR_KI = 0.05
-PATH_ANGULAR_KD = 0.1
-
 # Motion limits
 MAX_LINEAR_VELOCITY = 0.5  # m/s
 MAX_ANGULAR_VELOCITY = 0.7  # rad/s
@@ -92,6 +75,11 @@ MAX_ANGULAR_VELOCITY = 0.7  # rad/s
 # Deterrent behavior parameters
 DETERRENT_SOUND_DISTANCE = 2.0  # m - distance at which to start playing sound
 SOUND_INTERVAL = 2.0  # seconds - minimum interval between sound plays
+
+# Obstacle avoidance parameters
+MIN_OBSTACLE_DISTANCE = 0.5  # m - minimum distance to obstacles
+OBSTACLE_AVOIDANCE_ANGULAR_VEL = 0.3  # rad/s - turning speed when avoiding obstacles
+FRONT_SCAN_ANGLE = math.pi / 6  # ±30 degrees for front obstacle detection
 
 # Timeout parameters
 TARGET_TIMEOUT = 5.0  # seconds - time without target before reporting lost
@@ -181,8 +169,6 @@ class ChaseController(Node):
             LaserScan, DEFAULT_SCAN_TOPIC, self._laser_callback, 1)
         self._target_sub = self.create_subscription(
             Pose, DEFAULT_TARGET_POSE_TOPIC, self._target_callback, 1)
-        self._map_sub = self.create_subscription(
-            OccupancyGrid, DEFAULT_OCCUPANCY_GRID_TOPIC, self._map_callback, 1)
         self._enable_sub = self.create_subscription(
             Bool, DEFAULT_CHASE_ENABLE_TOPIC, self._enable_callback, 1)
         self._mode_sub = self.create_subscription(
@@ -195,11 +181,6 @@ class ChaseController(Node):
         self._chase_enabled = False
         self._chase_mode = "chase"  # "chase" or "deterrent"
         
-        # Map and environment state (similar to pa3)
-        self._map: Optional[OccupancyGrid] = None
-        self._map_frame_id: Optional[str] = None
-        self._map_received = False
-        
         # Robot pose tracking (using TF2 like pa3)
         self._robot_x = 0.0
         self._robot_y = 0.0
@@ -208,13 +189,6 @@ class ChaseController(Node):
         self._last_linear_vel = 0.0
         self._last_angular_vel = 0.0
         
-        # Occupancy grid and path planning
-        self._occupancy_grid: Optional[OccupancyGrid] = None
-        self._grid_data: Optional[np.ndarray] = None
-        self._current_path: List[Tuple[float, float]] = []
-        self._path_index = 0
-        self._path_complete = True
-        
         # Target tracking
         self._target_pose: Optional[Pose] = None
         self._last_target_time: Optional[float] = None
@@ -222,10 +196,6 @@ class ChaseController(Node):
         # PID controllers
         self._linear_pid = PIDController(LINEAR_KP, LINEAR_KI, LINEAR_KD)
         self._angular_pid = PIDController(ANGULAR_KP, ANGULAR_KI, ANGULAR_KD)
-        
-        # Path following PID controllers
-        self._path_linear_pid = PIDController(PATH_LINEAR_KP, PATH_LINEAR_KI, PATH_LINEAR_KD)
-        self._path_angular_pid = PIDController(PATH_ANGULAR_KP, PATH_ANGULAR_KI, PATH_ANGULAR_KD)
         
         # Sound control for deterrent behavior
         self._last_sound_time: Optional[float] = None
@@ -238,12 +208,16 @@ class ChaseController(Node):
         
         # Obstacle detection
         self._obstacle_detected = False
-        self._min_obstacle_distance = 0.3  # m
         
         # Testing mode state
         self._testing_mode = TESTING_MODE
         self._test_running = False
         self._current_test_target = None
+        
+        # Time-to-Clear (TTC) tracking
+        self._chase_start_time: Optional[float] = None
+        self._ttc_measurements: List[float] = []
+        self._current_test_number = 0
         
         # Timer for main control loop
         self._timer = self.create_timer(1.0 / FREQUENCY, self._control_loop)
@@ -318,27 +292,6 @@ class ChaseController(Node):
         else:
             self.get_logger().warn(f"Invalid chase mode: {msg.data}")
     
-    def _map_callback(self, msg: OccupancyGrid):
-        """Handle occupancy grid messages (similar to pa3)."""
-        if not self._map_received:
-            self.get_logger().info("Map received from pa3 maze environment")
-            self._map_received = True
-        
-        self._map = msg
-        self._occupancy_grid = msg
-        self._map_frame_id = msg.header.frame_id
-        
-        # Convert occupancy grid data to numpy array for easier processing
-        width = msg.info.width
-        height = msg.info.height
-        self._grid_data = np.array(msg.data).reshape((height, width))
-        
-        self.get_logger().debug(f"Received occupancy grid: {width}x{height}, resolution: {msg.info.resolution}m")
-        
-        # If in testing mode and no test is running, prompt for test selection
-        if self._testing_mode and not self._test_running and self._map_received:
-            self._prompt_for_test_selection()
-    
     def _get_robot_pose(self) -> bool:
         """Get the current pose of the robot using TF lookup (similar to pa3)."""
         try:
@@ -379,26 +332,22 @@ class ChaseController(Node):
         self._target_pose = msg
         self._last_target_time = current_time
         
-        # Plan path to target when target is detected and chase is enabled
-        if self._chase_enabled and self._chase_mode == "chase":
-            self._plan_path_to_target()
-        
         self._publish_status("target_detected")
     
     def _laser_callback(self, msg: LaserScan):
         """Handle laser scan messages for obstacle detection."""
         # Check for obstacles in front of robot
-        front_angles = []
+        front_ranges = []
         for i, range_val in enumerate(msg.ranges):
             angle = msg.angle_min + i * msg.angle_increment
-            # Check angles roughly in front of robot (±30 degrees)
-            if -math.pi/6 <= angle <= math.pi/6:
+            # Check angles in front of robot using FRONT_SCAN_ANGLE
+            if -FRONT_SCAN_ANGLE <= angle <= FRONT_SCAN_ANGLE:
                 if msg.range_min <= range_val <= msg.range_max:
-                    front_angles.append(range_val)
+                    front_ranges.append(range_val)
         
-        if front_angles:
-            min_distance = min(front_angles)
-            self._obstacle_detected = min_distance < self._min_obstacle_distance
+        if front_ranges:
+            min_distance = min(front_ranges)
+            self._obstacle_detected = min_distance < MIN_OBSTACLE_DISTANCE
         else:
             self._obstacle_detected = False
     
@@ -428,7 +377,7 @@ class ChaseController(Node):
                 self._update_chase_mode_based_on_distance(target_distance)
                 
                 if self._chase_mode == "chase":
-                    self._chase_behavior_with_planning(current_time)
+                    self._direct_chase_behavior(current_time)
                     self._publish_state("CHASE")
                 elif self._chase_mode == "deterrent":
                     self._deterrent_behavior(current_time)
@@ -492,61 +441,66 @@ class ChaseController(Node):
         fsm_msg.data = status
         self._fsm_status_pub.publish(fsm_msg)
     
-    def _chase_behavior_with_planning(self, current_time: float):
-        """Implement chase behavior using path planning and PID control."""
-        if self._target_pose is None:
-            return
-        
-        # Check if we need to replan (target moved significantly or no current path)
-        if not self._current_path or self._path_complete:
-            self._plan_path_to_target()
-        
-        # Follow the planned path
-        if self._current_path and not self._path_complete:
-            self._follow_path(current_time)
-            self._publish_status("following_path")
-        else:
-            # Fallback to direct approach if no path available
-            self._direct_chase_behavior(current_time)
-            self._publish_status("direct_chase")
-    
     def _direct_chase_behavior(self, current_time: float):
-        """Direct chase behavior (original implementation) as fallback."""
+        """Direct chase behavior using PID control with lidar obstacle avoidance."""
         if self._target_pose is None:
             return
         
         # Calculate distance and angle to target
-        target_distance = math.sqrt(
-            self._target_pose.position.x**2 + self._target_pose.position.y**2)
-        target_angle = math.atan2(
-            self._target_pose.position.y, self._target_pose.position.x)
+        target_x = self._target_pose.position.x
+        target_y = self._target_pose.position.y
+        
+        # Transform target from robot frame to world frame
+        dx = target_x - self._robot_x
+        dy = target_y - self._robot_y
+        target_distance = math.sqrt(dx**2 + dy**2)
+        target_angle = math.atan2(dy, dx)
         
         # Distance error (positive means too far, negative means too close)
         distance_error = target_distance - TARGET_DISTANCE
         
-        # Angular error (angle to target)
-        angular_error = target_angle
+        # Angular error (angle to target relative to robot heading)
+        angular_error = target_angle - self._robot_theta
+        
+        # Normalize angular error to [-pi, pi]
+        while angular_error > math.pi:
+            angular_error -= 2 * math.pi
+        while angular_error < -math.pi:
+            angular_error += 2 * math.pi
         
         # PID control
         linear_output = self._linear_pid.update(distance_error, current_time)
         angular_output = self._angular_pid.update(angular_error, current_time)
         
-        # Apply limits and obstacle avoidance
-        if self._obstacle_detected and distance_error > 0:
-            # Stop if obstacle detected while approaching
-            linear_velocity = 0.0
-            angular_velocity = 0.5  # Turn to avoid obstacle
-        else:
-            linear_velocity = max(-MAX_LINEAR_VELOCITY, 
-                                min(MAX_LINEAR_VELOCITY, linear_output))
-            angular_velocity = max(-MAX_ANGULAR_VELOCITY, 
-                                 min(MAX_ANGULAR_VELOCITY, angular_output))
+        # Apply velocity limits
+        linear_velocity = max(-MAX_LINEAR_VELOCITY, 
+                            min(MAX_LINEAR_VELOCITY, linear_output))
+        angular_velocity = max(-MAX_ANGULAR_VELOCITY, 
+                             min(MAX_ANGULAR_VELOCITY, angular_output))
+        
+        # Obstacle avoidance using lidar
+        if self._obstacle_detected:
+            if distance_error > 0:  # Only avoid if we're trying to approach
+                # Stop forward motion and turn to avoid obstacle
+                linear_velocity = 0.0
+                # Turn away from obstacle (use sign of angular error to determine direction)
+                if angular_error > 0:
+                    angular_velocity = OBSTACLE_AVOIDANCE_ANGULAR_VEL
+                else:
+                    angular_velocity = -OBSTACLE_AVOIDANCE_ANGULAR_VEL
+                
+                self.get_logger().debug("Obstacle detected - avoiding")
         
         self._publish_velocity(linear_velocity, angular_velocity)
         
         # Check if target distance is achieved
         if abs(distance_error) < DISTANCE_TOLERANCE:
             self._publish_status("target_reached")
+        else:
+            if self._obstacle_detected:
+                self._publish_status("avoiding_obstacle")
+            else:
+                self._publish_status("chasing_target")
     
     def _deterrent_behavior(self, current_time: float):
         """Implement deterrent behavior (play sound to scare target and stop)."""
@@ -565,6 +519,25 @@ class ChaseController(Node):
                 (current_time - self._last_sound_time) >= SOUND_INTERVAL):
                 
                 self._play_deterrent_sound(current_time)
+                
+                # Calculate and record Time-to-Clear (TTC)
+                if self._chase_start_time is not None:
+                    ttc = current_time - self._chase_start_time
+                    self._ttc_measurements.append(ttc)
+                    
+                    # Calculate average TTC
+                    avg_ttc = sum(self._ttc_measurements) / len(self._ttc_measurements)
+                    
+                    self.get_logger().info("=" * 60)
+                    self.get_logger().info("🎯 TIME-TO-CLEAR (TTC) METRICS")
+                    self.get_logger().info("=" * 60)
+                    self.get_logger().info(f"Test #{self._current_test_number} TTC: {ttc:.2f} seconds")
+                    self.get_logger().info(f"Average TTC ({len(self._ttc_measurements)} tests): {avg_ttc:.2f} seconds")
+                    self.get_logger().info(f"All TTC measurements: {[f'{t:.2f}s' for t in self._ttc_measurements]}")
+                    self.get_logger().info("=" * 60)
+                    
+                    # Reset chase start time
+                    self._chase_start_time = None
                 
                 # After playing sound, stop the chase controller
                 self.get_logger().info("Deterrent sound played - stopping chase controller")
@@ -656,216 +629,6 @@ class ChaseController(Node):
         
         self.get_logger().info(f"Simulated alarm sound #{self._sound_count} played successfully")
     
-    def _plan_path_to_target(self):
-        """Plan a path to the target using BFS on the occupancy grid."""
-        if self._occupancy_grid is None or self._target_pose is None:
-            self.get_logger().warn("Cannot plan path: missing occupancy grid or target")
-            return
-        
-        # Convert robot and target positions to grid coordinates
-        robot_grid = self._world_to_grid(self._robot_x, self._robot_y)
-        target_world_x = self._target_pose.position.x
-        target_world_y = self._target_pose.position.y
-        
-        # Calculate target approach position (TARGET_DISTANCE away from target)
-        target_distance = math.sqrt(target_world_x**2 + target_world_y**2)
-        if target_distance > TARGET_DISTANCE:
-            # Calculate position TARGET_DISTANCE away from target
-            approach_ratio = (target_distance - TARGET_DISTANCE) / target_distance
-            approach_x = target_world_x * approach_ratio
-            approach_y = target_world_y * approach_ratio
-        else:
-            # Already close enough, use current robot position
-            approach_x = self._robot_x
-            approach_y = self._robot_y
-        
-        target_grid = self._world_to_grid(approach_x, approach_y)
-        
-        if robot_grid is None or target_grid is None:
-            self.get_logger().warn("Robot or target position outside grid bounds")
-            return
-        
-        # Run BFS to find path
-        path_grid = self._bfs_path_planning(robot_grid, target_grid)
-        
-        if path_grid:
-            # Convert grid path back to world coordinates
-            self._current_path = [self._grid_to_world(gx, gy) for gx, gy in path_grid]
-            self._path_index = 0
-            self._path_complete = False
-            self.get_logger().info(f"Planned path with {len(self._current_path)} waypoints")
-        else:
-            self.get_logger().warn("No path found to target")
-            self._current_path = []
-            self._path_complete = True
-    
-    def _bfs_path_planning(self, start: Tuple[int, int], goal: Tuple[int, int]) -> List[Tuple[int, int]]:
-        """BFS path planning on occupancy grid."""
-        if self._grid_data is None:
-            return []
-        
-        height, width = self._grid_data.shape
-        
-        # Check if start and goal are valid
-        if not self._is_valid_cell(start[0], start[1]) or not self._is_valid_cell(goal[0], goal[1]):
-            return []
-        
-        # BFS setup
-        queue = deque([(start, [start])])
-        visited = set([start])
-        
-        # 8-connected movement (including diagonals)
-        directions = [(-1, -1), (-1, 0), (-1, 1), (0, -1), (0, 1), (1, -1), (1, 0), (1, 1)]
-        
-        while queue:
-            (current, path) = queue.popleft()
-            
-            # Check if we reached the goal
-            if current == goal:
-                return path
-            
-            # Explore neighbors
-            for dx, dy in directions:
-                next_x, next_y = current[0] + dx, current[1] + dy
-                next_cell = (next_x, next_y)
-                
-                if (next_cell not in visited and 
-                    0 <= next_x < height and 0 <= next_y < width and
-                    self._is_valid_cell(next_x, next_y)):
-                    
-                    visited.add(next_cell)
-                    new_path = path + [next_cell]
-                    queue.append((next_cell, new_path))
-        
-        return []  # No path found
-    
-    def _is_valid_cell(self, x: int, y: int) -> bool:
-        """Check if a grid cell is valid (free space) for robot movement."""
-        if self._grid_data is None:
-            return False
-        
-        height, width = self._grid_data.shape
-        
-        # Check bounds
-        if x < 0 or x >= height or y < 0 or y >= width:
-            return False
-        
-        # Check if cell is free (considering robot radius)
-        robot_radius_cells = int(ROBOT_RADIUS / self._occupancy_grid.info.resolution)
-        
-        for dx in range(-robot_radius_cells, robot_radius_cells + 1):
-            for dy in range(-robot_radius_cells, robot_radius_cells + 1):
-                check_x, check_y = x + dx, y + dy
-                
-                if (0 <= check_x < height and 0 <= check_y < width):
-                    cell_value = self._grid_data[check_x, check_y]
-                    # Cell is obstacle if value > threshold or unknown (-1)
-                    if cell_value > OCCUPANCY_THRESHOLD or cell_value == -1:
-                        return False
-        
-        return True
-    
-    def _world_to_grid(self, world_x: float, world_y: float) -> Optional[Tuple[int, int]]:
-        """Convert world coordinates to grid coordinates."""
-        if self._occupancy_grid is None:
-            return None
-        
-        # Transform world coordinates to grid coordinates
-        origin_x = self._occupancy_grid.info.origin.position.x
-        origin_y = self._occupancy_grid.info.origin.position.y
-        resolution = self._occupancy_grid.info.resolution
-        
-        grid_x = int((world_x - origin_x) / resolution)
-        grid_y = int((world_y - origin_y) / resolution)
-        
-        # Check bounds
-        if (0 <= grid_x < self._occupancy_grid.info.height and 
-            0 <= grid_y < self._occupancy_grid.info.width):
-            return (grid_x, grid_y)
-        
-        return None
-    
-    def _grid_to_world(self, grid_x: int, grid_y: int) -> Tuple[float, float]:
-        """Convert grid coordinates to world coordinates."""
-        if self._occupancy_grid is None:
-            return (0.0, 0.0)
-        
-        origin_x = self._occupancy_grid.info.origin.position.x
-        origin_y = self._occupancy_grid.info.origin.position.y
-        resolution = self._occupancy_grid.info.resolution
-        
-        world_x = origin_x + (grid_x + 0.5) * resolution
-        world_y = origin_y + (grid_y + 0.5) * resolution
-        
-        return (world_x, world_y)
-    
-    def _follow_path(self, current_time: float):
-        """Follow the planned path using PID control."""
-        if not self._current_path or self._path_index >= len(self._current_path):
-            self._path_complete = True
-            return
-        
-        # Get current waypoint
-        waypoint_x, waypoint_y = self._current_path[self._path_index]
-        
-        # Calculate distance to current waypoint
-        dx = waypoint_x - self._robot_x
-        dy = waypoint_y - self._robot_y
-        distance_to_waypoint = math.sqrt(dx**2 + dy**2)
-        
-        # Check if we've reached the current waypoint
-        if distance_to_waypoint < PATH_RESOLUTION:
-            self._path_index += 1
-            if self._path_index >= len(self._current_path):
-                self._path_complete = True
-                self.get_logger().info("Path following complete")
-                return
-            else:
-                # Move to next waypoint
-                waypoint_x, waypoint_y = self._current_path[self._path_index]
-                dx = waypoint_x - self._robot_x
-                dy = waypoint_y - self._robot_y
-                distance_to_waypoint = math.sqrt(dx**2 + dy**2)
-        
-        # Calculate desired heading to waypoint
-        desired_heading = math.atan2(dy, dx)
-        
-        # Calculate heading error
-        heading_error = desired_heading - self._robot_theta
-        
-        # Normalize heading error to [-pi, pi]
-        while heading_error > math.pi:
-            heading_error -= 2 * math.pi
-        while heading_error < -math.pi:
-            heading_error += 2 * math.pi
-        
-        # Calculate distance to final target for speed modulation
-        if self._target_pose is not None:
-            target_distance = math.sqrt(
-                self._target_pose.position.x**2 + self._target_pose.position.y**2)
-            
-            # Slow down as we approach the target
-            speed_factor = min(1.0, max(0.2, (target_distance - TARGET_DISTANCE) / 2.0))
-        else:
-            speed_factor = 1.0
-        
-        # PID control for path following
-        linear_output = self._path_linear_pid.update(distance_to_waypoint, current_time)
-        angular_output = self._path_angular_pid.update(heading_error, current_time)
-        
-        # Apply speed factor and limits
-        linear_velocity = max(-MAX_LINEAR_VELOCITY, 
-                            min(MAX_LINEAR_VELOCITY, linear_output * speed_factor))
-        angular_velocity = max(-MAX_ANGULAR_VELOCITY, 
-                             min(MAX_ANGULAR_VELOCITY, angular_output))
-        
-        # Emergency stop if obstacle detected
-        if self._obstacle_detected:
-            linear_velocity = 0.0
-            angular_velocity = 0.3  # Slight turn to try to avoid obstacle
-        
-        self._publish_velocity(linear_velocity, angular_velocity)
-    
     def _check_target_timeout(self, current_time: float) -> bool:
         """Check if target has timed out."""
         if self._last_target_time is None:
@@ -898,8 +661,6 @@ class ChaseController(Node):
         """Reset PID controllers and sound state."""
         self._linear_pid.reset()
         self._angular_pid.reset()
-        self._path_linear_pid.reset()
-        self._path_angular_pid.reset()
         
         # Reset sound state
         self._last_sound_time = None
@@ -940,30 +701,20 @@ class ChaseController(Node):
     def _start_testing_interface(self):
         """Start the testing interface in a separate thread."""
         self.get_logger().info("Starting integrated testing interface...")
-        self.get_logger().info("Waiting for map from pa3 maze environment...")
         
         # Start command interface thread
         self._command_thread = threading.Thread(target=self._testing_command_interface, daemon=True)
         self._command_thread.start()
     
-    def _prompt_for_test_selection(self):
-        """Prompt user for test selection once map is available."""
-        if not self._map_received:
-            return
-            
-        self.get_logger().info("=== PA3 Maze Environment Ready ===")
-        self.get_logger().info("Enter target intruder pose coordinates:")
-        self.get_logger().info("Commands: test <x,y>, status, help, quit")
-        self.get_logger().info("Example: test 3.5,4.2")
-    
     def _testing_command_interface(self):
-        """Interactive command interface for testing (similar to pa3)."""
+        """Interactive command interface for testing."""
+        self.get_logger().info("=== Chase Controller Ready ===")
+        self.get_logger().info("Enter target intruder pose coordinates:")
+        self.get_logger().info("Commands: test <x,y>, status, ttc, help, quit")
+        self.get_logger().info("Example: test 3.5,4.2")
+        
         while rclpy.ok():
             try:
-                if not self._map_received:
-                    time.sleep(1.0)
-                    continue
-                    
                 command = input("\nChase Controller> ").strip().lower()
                 
                 if command.startswith("test "):
@@ -971,6 +722,8 @@ class ChaseController(Node):
                     self._run_test_target(coords)
                 elif command == "status":
                     self._show_status()
+                elif command == "ttc" or command == "metrics":
+                    self._show_ttc_metrics()
                 elif command == "help":
                     self._show_help()
                 elif command == "quit" or command == "exit":
@@ -997,8 +750,13 @@ class ChaseController(Node):
             self._test_running = True
             self._current_test_target = f"intruder_({x},{y})"
             
+            # Record chase start time for TTC calculation
+            self._chase_start_time = self.get_clock().now().nanoseconds / 1e9
+            self._current_test_number += 1
+            
             self.get_logger().info(f"Targeting intruder at ({x}, {y})")
             self.get_logger().info("Starting in CHASE mode - will auto-switch to DETERRENT when within 1m")
+            self.get_logger().info(f"Test #{self._current_test_number} - Chase timer started")
             
         except ValueError:
             self.get_logger().error("Invalid coordinates. Use format: x,y (e.g., 2.0,3.5)")
@@ -1015,10 +773,6 @@ class ChaseController(Node):
         # Update internal target
         self._target_pose = target_pose
         self._last_target_time = self.get_clock().now().nanoseconds / 1e9
-        
-        # Plan path if in chase mode
-        if self._chase_mode == "chase":
-            self._plan_path_to_target()
     
     def _show_status(self):
         """Show current system status."""
@@ -1026,7 +780,6 @@ class ChaseController(Node):
         pose_available = self._get_robot_pose()
         
         self.get_logger().info("=== Chase Controller Status ===")
-        self.get_logger().info(f"Map received: {self._map_received}")
         self.get_logger().info(f"Chase enabled: {self._chase_enabled}")
         self.get_logger().info(f"Chase mode: {self._chase_mode}")
         self.get_logger().info(f"Test running: {self._test_running}")
@@ -1044,17 +797,38 @@ class ChaseController(Node):
             self.get_logger().info(f"Distance to target: {target_distance:.2f}m")
         else:
             self.get_logger().info("Target: None")
+            
+        # Show TTC information
+        if self._chase_start_time is not None:
+            current_time = self.get_clock().now().nanoseconds / 1e9
+            elapsed_time = current_time - self._chase_start_time
+            self.get_logger().info(f"Current chase elapsed time: {elapsed_time:.2f}s")
+        
+        if self._ttc_measurements:
+            avg_ttc = sum(self._ttc_measurements) / len(self._ttc_measurements)
+            self.get_logger().info(f"TTC measurements: {len(self._ttc_measurements)} tests, avg: {avg_ttc:.2f}s")
+    
+    def _show_ttc_metrics(self):
+        """Show Time-to-Clear (TTC) metrics."""
+        if self._ttc_measurements:
+            self.get_logger().info("=== Time-to-Clear (TTC) Metrics ===")
+            self.get_logger().info(f"All TTC measurements: {[f'{t:.2f}s' for t in self._ttc_measurements]}")
+            self.get_logger().info(f"Average TTC: {sum(self._ttc_measurements) / len(self._ttc_measurements):.2f} seconds")
+        else:
+            self.get_logger().info("No TTC measurements available.")
     
     def _show_help(self):
         """Show help information."""
         self.get_logger().info("=== Chase Controller Commands ===")
         self.get_logger().info("test <x,y>           - Set target intruder pose and start chase")
         self.get_logger().info("status               - Show system status")
+        self.get_logger().info("ttc/metrics          - Show Time-to-Clear (TTC) metrics")
         self.get_logger().info("help                 - Show this help")
         self.get_logger().info("quit/exit            - Exit program")
         self.get_logger().info("")
         self.get_logger().info("Behavior:")
-        self.get_logger().info("- Robot starts in CHASE mode")
+        self.get_logger().info("- Robot uses direct chase with PID control")
+        self.get_logger().info("- Lidar-based obstacle avoidance")
         self.get_logger().info("- Auto-switches to DETERRENT when within 1.0m of target")
         self.get_logger().info("- Plays alarm sound and STOPS after deterrent activation")
         self.get_logger().info("- Publishes states to /chase_state and /fsm_status topics")
