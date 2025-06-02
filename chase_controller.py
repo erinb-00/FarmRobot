@@ -24,6 +24,7 @@ from rclpy.node import Node
 from rclpy.duration import Duration
 from geometry_msgs.msg import Twist, Pose, Point, TransformStamped
 from sensor_msgs.msg import LaserScan
+from nav_msgs.msg import Odometry
 from std_srvs.srv import SetBool
 from std_msgs.msg import String, Bool, Empty
 from tf2_ros import TransformBroadcaster, TransformException
@@ -40,15 +41,15 @@ except ImportError:
     print("Warning: pygame not available. Sound will be simulated only.")
 
 # Constants
-DEFAULT_CMD_VEL_TOPIC = 'cmd_vel'
-DEFAULT_SCAN_TOPIC = 'base_scan'
-DEFAULT_TARGET_POSE_TOPIC = 'target_pose'
+DEFAULT_CMD_VEL_TOPIC = 'rosbot/cmd_vel'
+DEFAULT_SCAN_TOPIC = 'rosbot/base_scan'
+DEFAULT_TARGET_ODOM_TOPIC = 'rosbot2/odom'
 DEFAULT_OCCUPANCY_GRID_TOPIC = 'map'
 DEFAULT_CHASE_ENABLE_TOPIC = 'chase_enable'
 DEFAULT_CHASE_MODE_TOPIC = 'chase_mode'
 DEFAULT_CHASE_STATUS_TOPIC = 'chase_status'
 DEFAULT_SOUND_TOPIC = 'play_sound'
-DEFAULT_BASE_FRAME = 'base_link'
+DEFAULT_BASE_FRAME = 'rosbot/base_link'
 DEFAULT_WORLD_FRAME = 'map'
 
 # Sound file path (relative to the workspace)
@@ -85,7 +86,7 @@ FRONT_SCAN_ANGLE = math.pi / 6  # ±30 degrees for front obstacle detection
 TARGET_TIMEOUT = 5.0  # seconds - time without target before reporting lost
 
 # Testing mode parameters
-TESTING_MODE = True  # Set to True to enable integrated testing
+TESTING_MODE = False  # Set to False since we're using real robot tracking
 
 # State transition parameters
 CHASE_TO_DETERRENT_DISTANCE = 1.0  # m - distance at which to switch from chase to deterrent
@@ -167,8 +168,8 @@ class ChaseController(Node):
         
         self._laser_sub = self.create_subscription(
             LaserScan, DEFAULT_SCAN_TOPIC, self._laser_callback, 1)
-        self._target_sub = self.create_subscription(
-            Pose, DEFAULT_TARGET_POSE_TOPIC, self._target_callback, 1)
+        self._target_odom_sub = self.create_subscription(
+            Odometry, DEFAULT_TARGET_ODOM_TOPIC, self._target_odom_callback, 1)
         self._enable_sub = self.create_subscription(
             Bool, DEFAULT_CHASE_ENABLE_TOPIC, self._enable_callback, 1)
         self._mode_sub = self.create_subscription(
@@ -189,7 +190,7 @@ class ChaseController(Node):
         self._last_linear_vel = 0.0
         self._last_angular_vel = 0.0
         
-        # Target tracking
+        # Target tracking (now from rosbot2/odom)
         self._target_pose: Optional[Pose] = None
         self._last_target_time: Optional[float] = None
         
@@ -209,15 +210,17 @@ class ChaseController(Node):
         # Obstacle detection
         self._obstacle_detected = False
         
-        # Testing mode state
+        # Testing mode state (disabled for real robot tracking)
         self._testing_mode = TESTING_MODE
         self._test_running = False
         self._current_test_target = None
         
-        # Time-to-Clear (TTC) tracking
+        # Time-to-Clear (TTC) tracking and chase state management
         self._chase_start_time: Optional[float] = None
         self._ttc_measurements: List[float] = []
         self._current_test_number = 0
+        self._deterrent_triggered = False  # Flag to ensure deterrent only triggers once per chase
+        self._chase_completed = False  # Flag to track if current chase is completed
         
         # Timer for main control loop
         self._timer = self.create_timer(1.0 / FREQUENCY, self._control_loop)
@@ -226,11 +229,11 @@ class ChaseController(Node):
         self.get_logger().info("Initializing chase controller...")
         time.sleep(1.0)
         
-        self.get_logger().info("Chase Controller initialized")
+        self.get_logger().info("Chase Controller initialized - tracking rosbot2 via odometry")
         
-        # Start testing interface if enabled
-        if self._testing_mode:
-            self._start_testing_interface()
+        # Auto-enable chase controller since we're tracking a real robot
+        self._chase_enabled = True
+        self.get_logger().info("Chase controller auto-enabled for rosbot2 tracking")
     
     def _init_sound_system(self):
         """Initialize the sound system and load alarm sound."""
@@ -296,7 +299,7 @@ class ChaseController(Node):
         """Get the current pose of the robot using TF lookup (similar to pa3)."""
         try:
             # Process any pending callbacks
-            rclpy.spin_once(self, timeout_sec=0.01)
+            # rclpy.spin_once(self, timeout_sec=0.01)
             
             # For lookup_transform, get robot position in map frame
             tf_msg = self.tf_buffer.lookup_transform(
@@ -325,12 +328,33 @@ class ChaseController(Node):
             self.get_logger().debug(f"Could not get transform: {ex}")
             return False
     
-    def _target_callback(self, msg: Pose):
-        """Handle target pose messages from perception node."""
+    def _target_odom_callback(self, msg: Odometry):
+        """Handle target robot odometry messages from rosbot2/odom."""
         current_time = self.get_clock().now().nanoseconds / 1e9
         
-        self._target_pose = msg
+        x_offset = 2.0
+        y_offset = 5.0
+
+        # Extract pose from odometry message
+        target_pose = Pose()
+        target_pose.position.x = msg.pose.pose.position.x + x_offset
+        target_pose.position.y = msg.pose.pose.position.y + y_offset
+        target_pose.position.z = msg.pose.pose.position.z
+        target_pose.orientation = msg.pose.pose.orientation
+        
+        self._target_pose = target_pose
         self._last_target_time = current_time
+        
+        # Log the target pose received from rosbot2/odom
+        self.get_logger().debug(f"Target pose from rosbot2/odom: x={target_pose.position.x:.3f}, y={target_pose.position.y:.3f}")
+        
+        # Start chase timer if this is the first target detection and no chase is in progress
+        if self._chase_start_time is None and self._chase_enabled and not self._chase_completed:
+            self._chase_start_time = current_time
+            self._current_test_number += 1
+            self._deterrent_triggered = False  # Reset deterrent flag for new chase
+            self._chase_completed = False  # Reset completion flag
+            self.get_logger().info(f"Target robot detected - starting chase #{self._current_test_number}")
         
         self._publish_status("target_detected")
     
@@ -372,7 +396,7 @@ class ChaseController(Node):
             if pose_available:  # Only proceed if we have valid robot pose
                 # Calculate distance to target for state transitions
                 target_distance = self._calculate_target_distance()
-                
+
                 # Automatic state transitions based on distance (only chase -> deterrent)
                 self._update_chase_mode_based_on_distance(target_distance)
                 
@@ -393,12 +417,12 @@ class ChaseController(Node):
         else:
             # Stop robot if not chasing or if deterrent is complete
             self._stop_robot()
-            if not self._chase_enabled and self._test_running == False:
+            if not self._chase_enabled:
                 self._publish_state("STOPPED")
                 self._publish_fsm_status("stopped")
             else:
                 self._publish_state("IDLE")
-                self._publish_fsm_status("disabled")
+                self._publish_fsm_status("waiting_for_target")
     
     def _calculate_target_distance(self) -> float:
         """Calculate distance to current target."""
@@ -417,13 +441,12 @@ class ChaseController(Node):
         """Automatically update chase mode based on distance to target."""
         previous_mode = self._chase_mode
         
-        if self._chase_mode == "chase":
-            # Switch to deterrent when close enough
+        if self._chase_mode == "chase" and not self._deterrent_triggered:
+            # Switch to deterrent when close enough (only if not already triggered)
             if target_distance <= CHASE_TO_DETERRENT_DISTANCE:
                 self._chase_mode = "deterrent"
+                self._deterrent_triggered = True  # Mark deterrent as triggered
                 self.get_logger().info(f"Auto-switching to DETERRENT mode (distance: {target_distance:.2f}m)")
-        
-        # Note: No return to chase state - deterrent is final state
         
         # Reset controllers if mode changed
         if previous_mode != self._chase_mode:
@@ -445,7 +468,9 @@ class ChaseController(Node):
         """Direct chase behavior using PID control with lidar obstacle avoidance."""
         if self._target_pose is None:
             return
-        
+
+        print(self._target_pose)
+
         # Calculate distance and angle to target
         target_x = self._target_pose.position.x
         target_y = self._target_pose.position.y
@@ -503,53 +528,57 @@ class ChaseController(Node):
                 self._publish_status("chasing_target")
     
     def _deterrent_behavior(self, current_time: float):
-        """Implement deterrent behavior (play sound to scare target and stop)."""
+        """Implement deterrent behavior (play sound to scare target and stop) - only once per chase."""
         if self._target_pose is None:
             return
         
         # Calculate distance to target
-        target_x = self._target_pose.position.x
-        target_y = self._target_pose.position.y
-        target_distance = math.sqrt(target_x**2 + target_y**2)
+        target_distance = self._calculate_target_distance()
         
-        # Check if robot is close enough to play deterrent sound
-        if target_distance <= DETERRENT_SOUND_DISTANCE:
-            # Play sound if we haven't played it recently
-            if (self._last_sound_time is None or 
-                (current_time - self._last_sound_time) >= SOUND_INTERVAL):
-                
-                self._play_deterrent_sound(current_time)
-                
-                # Calculate and record Time-to-Clear (TTC)
-                if self._chase_start_time is not None:
-                    ttc = current_time - self._chase_start_time
-                    self._ttc_measurements.append(ttc)
+        # Only execute deterrent if we haven't completed this chase yet
+        if not self._chase_completed:
+            # Check if robot is close enough to play deterrent sound
+            if target_distance <= DETERRENT_SOUND_DISTANCE:
+                # Play sound if we haven't played it recently
+                if (self._last_sound_time is None or 
+                    (current_time - self._last_sound_time) >= SOUND_INTERVAL):
                     
-                    # Calculate average TTC
-                    avg_ttc = sum(self._ttc_measurements) / len(self._ttc_measurements)
+                    self._play_deterrent_sound(current_time)
                     
-                    self.get_logger().info("=" * 60)
-                    self.get_logger().info("🎯 TIME-TO-CLEAR (TTC) METRICS")
-                    self.get_logger().info("=" * 60)
-                    self.get_logger().info(f"Test #{self._current_test_number} TTC: {ttc:.2f} seconds")
-                    self.get_logger().info(f"Average TTC ({len(self._ttc_measurements)} tests): {avg_ttc:.2f} seconds")
-                    self.get_logger().info(f"All TTC measurements: {[f'{t:.2f}s' for t in self._ttc_measurements]}")
-                    self.get_logger().info("=" * 60)
+                    # Calculate and record Time-to-Clear (TTC) - only once per chase
+                    if self._chase_start_time is not None:
+                        ttc = current_time - self._chase_start_time
+                        self._ttc_measurements.append(ttc)
+                        
+                        # Calculate average TTC
+                        avg_ttc = sum(self._ttc_measurements) / len(self._ttc_measurements)
+                        
+                        self.get_logger().info("=" * 60)
+                        self.get_logger().info("🎯 TIME-TO-CLEAR (TTC) METRICS")
+                        self.get_logger().info("=" * 60)
+                        self.get_logger().info(f"Chase #{self._current_test_number} TTC: {ttc:.2f} seconds")
+                        self.get_logger().info(f"Average TTC ({len(self._ttc_measurements)} chases): {avg_ttc:.2f} seconds")
+                        self.get_logger().info(f"All TTC measurements: {[f'{t:.2f}s' for t in self._ttc_measurements]}")
+                        self.get_logger().info("=" * 60)
+                        
+                        # Mark this chase as completed
+                        self._chase_completed = True
+                        self._chase_start_time = None  # Reset for potential next chase
                     
-                    # Reset chase start time
-                    self._chase_start_time = None
+                    # After playing sound, stop the chase controller for this cycle
+                    self.get_logger().info("Deterrent sound played - chase cycle completed")
+                    self._publish_status("deterrent_complete_chase_finished")
+                    self._publish_state("STOPPED")
+                    self._publish_fsm_status("deterrent_complete_stopped")
                 
-                # After playing sound, stop the chase controller
-                self.get_logger().info("Deterrent sound played - stopping chase controller")
-                self._chase_enabled = False
-                self._test_running = False
-                self._publish_status("deterrent_complete")
-                self._publish_state("STOPPED")
-                self._publish_fsm_status("deterrent_complete_stopped")
-            
-            self._publish_status("deterrent_active_with_sound")
+                self._publish_status("deterrent_active_with_sound")
+            else:
+                self._publish_status("deterrent_waiting")
         else:
-            self._publish_status("deterrent_waiting")
+            # Chase is completed, just stay stopped
+            self._publish_status("chase_cycle_completed")
+            self._publish_state("STOPPED")
+            self._publish_fsm_status("chase_cycle_completed")
         
         # Stop the robot - deterrent mode only plays sound, no movement
         self._stop_robot()
@@ -697,142 +726,6 @@ class ChaseController(Node):
             (point1.y - point2.y)**2 + 
             (point1.z - point2.z)**2
         )
-    
-    def _start_testing_interface(self):
-        """Start the testing interface in a separate thread."""
-        self.get_logger().info("Starting integrated testing interface...")
-        
-        # Start command interface thread
-        self._command_thread = threading.Thread(target=self._testing_command_interface, daemon=True)
-        self._command_thread.start()
-    
-    def _testing_command_interface(self):
-        """Interactive command interface for testing."""
-        self.get_logger().info("=== Chase Controller Ready ===")
-        self.get_logger().info("Enter target intruder pose coordinates:")
-        self.get_logger().info("Commands: test <x,y>, status, ttc, help, quit")
-        self.get_logger().info("Example: test 3.5,4.2")
-        
-        while rclpy.ok():
-            try:
-                command = input("\nChase Controller> ").strip().lower()
-                
-                if command.startswith("test "):
-                    coords = command[5:].strip()
-                    self._run_test_target(coords)
-                elif command == "status":
-                    self._show_status()
-                elif command == "ttc" or command == "metrics":
-                    self._show_ttc_metrics()
-                elif command == "help":
-                    self._show_help()
-                elif command == "quit" or command == "exit":
-                    self.get_logger().info("Exiting chase controller...")
-                    break
-                else:
-                    self.get_logger().warn(f"Unknown command: {command}")
-                    self.get_logger().info("Type 'help' for available commands")
-                    
-            except EOFError:
-                break
-            except Exception as e:
-                self.get_logger().error(f"Command error: {e}")
-    
-    def _run_test_target(self, coords: str):
-        """Run a test with user-defined target coordinates."""
-        try:
-            x, y = map(float, coords.split(','))
-            
-            # Always start in chase mode - will auto-transition to deterrent when close
-            self._chase_mode = "chase"
-            self._publish_test_target(x, y)
-            self._chase_enabled = True
-            self._test_running = True
-            self._current_test_target = f"intruder_({x},{y})"
-            
-            # Record chase start time for TTC calculation
-            self._chase_start_time = self.get_clock().now().nanoseconds / 1e9
-            self._current_test_number += 1
-            
-            self.get_logger().info(f"Targeting intruder at ({x}, {y})")
-            self.get_logger().info("Starting in CHASE mode - will auto-switch to DETERRENT when within 1m")
-            self.get_logger().info(f"Test #{self._current_test_number} - Chase timer started")
-            
-        except ValueError:
-            self.get_logger().error("Invalid coordinates. Use format: x,y (e.g., 2.0,3.5)")
-    
-    def _publish_test_target(self, x: float, y: float):
-        """Publish a test target pose."""
-        # Create target pose message
-        target_pose = Pose()
-        target_pose.position.x = x
-        target_pose.position.y = y
-        target_pose.position.z = 0.0
-        target_pose.orientation.w = 1.0
-        
-        # Update internal target
-        self._target_pose = target_pose
-        self._last_target_time = self.get_clock().now().nanoseconds / 1e9
-    
-    def _show_status(self):
-        """Show current system status."""
-        # Get current robot pose
-        pose_available = self._get_robot_pose()
-        
-        self.get_logger().info("=== Chase Controller Status ===")
-        self.get_logger().info(f"Chase enabled: {self._chase_enabled}")
-        self.get_logger().info(f"Chase mode: {self._chase_mode}")
-        self.get_logger().info(f"Test running: {self._test_running}")
-        if self._test_running:
-            self.get_logger().info(f"Current target: {self._current_test_target}")
-        
-        if pose_available:
-            self.get_logger().info(f"Robot pose: ({self._robot_x:.2f}, {self._robot_y:.2f}, {self._robot_theta:.2f})")
-        else:
-            self.get_logger().info("Robot pose: Not available")
-            
-        if self._target_pose:
-            target_distance = self._calculate_target_distance()
-            self.get_logger().info(f"Target: ({self._target_pose.position.x:.2f}, {self._target_pose.position.y:.2f})")
-            self.get_logger().info(f"Distance to target: {target_distance:.2f}m")
-        else:
-            self.get_logger().info("Target: None")
-            
-        # Show TTC information
-        if self._chase_start_time is not None:
-            current_time = self.get_clock().now().nanoseconds / 1e9
-            elapsed_time = current_time - self._chase_start_time
-            self.get_logger().info(f"Current chase elapsed time: {elapsed_time:.2f}s")
-        
-        if self._ttc_measurements:
-            avg_ttc = sum(self._ttc_measurements) / len(self._ttc_measurements)
-            self.get_logger().info(f"TTC measurements: {len(self._ttc_measurements)} tests, avg: {avg_ttc:.2f}s")
-    
-    def _show_ttc_metrics(self):
-        """Show Time-to-Clear (TTC) metrics."""
-        if self._ttc_measurements:
-            self.get_logger().info("=== Time-to-Clear (TTC) Metrics ===")
-            self.get_logger().info(f"All TTC measurements: {[f'{t:.2f}s' for t in self._ttc_measurements]}")
-            self.get_logger().info(f"Average TTC: {sum(self._ttc_measurements) / len(self._ttc_measurements):.2f} seconds")
-        else:
-            self.get_logger().info("No TTC measurements available.")
-    
-    def _show_help(self):
-        """Show help information."""
-        self.get_logger().info("=== Chase Controller Commands ===")
-        self.get_logger().info("test <x,y>           - Set target intruder pose and start chase")
-        self.get_logger().info("status               - Show system status")
-        self.get_logger().info("ttc/metrics          - Show Time-to-Clear (TTC) metrics")
-        self.get_logger().info("help                 - Show this help")
-        self.get_logger().info("quit/exit            - Exit program")
-        self.get_logger().info("")
-        self.get_logger().info("Behavior:")
-        self.get_logger().info("- Robot uses direct chase with PID control")
-        self.get_logger().info("- Lidar-based obstacle avoidance")
-        self.get_logger().info("- Auto-switches to DETERRENT when within 1.0m of target")
-        self.get_logger().info("- Plays alarm sound and STOPS after deterrent activation")
-        self.get_logger().info("- Publishes states to /chase_state and /fsm_status topics")
-        self.get_logger().info("- States: IDLE, WAITING, CHASE, DETERRENT, STOPPED")
 
 
 def main(args=None):
