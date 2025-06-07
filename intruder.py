@@ -29,8 +29,8 @@ DEFAULT_SCAN_TOPIC = 'scan'
 DEFAULT_CMD_VEL_TOPIC = 'cmd_vel'
 TF_BASE_LINK = 'base_link'
 TF_LASER_LINK = 'laser'
-detection_topic = '/detected_status'
-roboloc = 'rosbot/base_link'
+detection_topic = '/detected_status' 
+roboloc = 'rosbot/base_link' #listening topic for patrol robot
 visual = '/seerobot'
 
 USE_SIM_TIME = True
