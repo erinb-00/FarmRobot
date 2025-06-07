@@ -4,7 +4,7 @@ from rclpy.node import Node
 from rclpy.duration import Duration
 
 import tf2_ros # library for transformations.
-from tf2_ros import TransformException
+from tf2_ros import TransformException,TransformBroadcaster
 from nav_msgs.msg import OccupancyGrid
 from geometry_msgs.msg import TransformStamped,Twist,PoseArray,PointStamped
 from tf_transformations import euler_from_quaternion
@@ -15,7 +15,7 @@ import numpy as np
 #from skimage.draw import bresenham
 #import pybresenham
 #from bresenham import bresenham
-import math
+import math,time
 
 # Frequency at which the loop operates
 FREQUENCY = 10 #Hz.
@@ -30,7 +30,7 @@ DEFAULT_CMD_VEL_TOPIC = 'cmd_vel'
 TF_BASE_LINK = 'base_link'
 TF_LASER_LINK = 'laser'
 detection_topic = '/detected_status'
-roboloc = '/trackrobot'
+roboloc = 'rosbot/base_link'
 visual = '/seerobot'
 
 USE_SIM_TIME = True
@@ -59,6 +59,9 @@ class Intruder(Node):
         # Setting up transformation listener.
         self.tf_buffer = tf2_ros.Buffer()
         self.listener = tf2_ros.TransformListener(self.tf_buffer, self)
+
+        #initializing transform publishing
+        self.tf_broadcaster = TransformBroadcaster(self)
 
         #listening for messages
         #scan
@@ -160,7 +163,7 @@ class Intruder(Node):
             x = float(x)
             y = float(y)
             self.porter(x,y,stamp)
-            self.grid_publisher() #publishing map to rviz
+            
 
       #function that drives robot to a destination given a specific coordinate
     def porter(self,xpt,ypt,stamp):
@@ -233,7 +236,29 @@ class Intruder(Node):
             self.get_logger().warn(f"Could not get x, y from {target_frame} to {source_frame}: {e}")
             return None,None,None
 
-    
+    def transpublish(self):
+        t = TransformStamped()
+
+        # Set timestamp and frame ids
+        t.header.stamp = self.get_clock().now().to_msg()
+        t.header.frame_id = 'world'
+        t.child_frame_id = 'robot_base'
+
+        # translation
+        t.transform.translation.x = 1.0
+        t.transform.translation.y = 2.0
+        t.transform.translation.z = 0.0
+
+        # rotation 
+        t.transform.rotation.x = 0.0
+        t.transform.rotation.y = 0.0
+        t.transform.rotation.z = 0.0
+        t.transform.rotation.w = 1.0
+
+        # broadcasting transform
+        self.tf_broadcaster.sendTransform(t)
+
+
     def interact(self,stamp,thresh):
         robotloc = self.robot_trans 
         robox = robotloc.transform.translation.x
@@ -247,10 +272,25 @@ class Intruder(Node):
         if dist < thresh and self.visionfy == True: #detected message is published if robot can see intruder and it is in acceptable proximity
             det_msg = String()
             det_msg.data = 'Detected'
-            self.detpub.publish(det_msg)
+            #self.detpub.publish(det_msg)
+            self.transpublish()
             self.detected = True
         
     #need map to get location to move intruder to 
+    def ptgenerator(self,numsides):
+        side_length = 2.0
+        #angle = math.pi / numsides
+        radius = side_length / (2 * math.sin(math.pi / numsides))  
+
+        vertices = []
+        numsides = int(numsides)
+        for i in range(numsides):
+            theta = 2 * math.pi * i / numsides  
+            x = radius * math.cos(theta)
+            y = radius * math.sin(theta)
+            vertices.append((x, y))
+        
+        return vertices
 
 #Running functions
 def main(args=None):
@@ -260,13 +300,15 @@ def main(args=None):
     
     #Moving intruder to location
     print(stamp)
-    vertices = None
+    numsides = float(input("How many points do you want the robot to travel to?: "))
+    vertices = intrude.ptgenerator(numsides)
+    #vertices = None
     intrude.driver(vertices,stamp)
     
     #interacting with nearby robot
-    thresh = 1
-    robotloc = None
-    intrude.interact(stamp,thresh)
+    # thresh = 1
+    # robotloc = None
+    # intrude.interact(stamp,thresh)
 
 
     intrude.destroy_node()
