@@ -269,7 +269,7 @@ class Intruder(Node):
 
         #computing distance between robots
         dist = math.sqrt((robox - mylocx)**2 + (roboy - mylocy)**2)
-        if dist < thresh and self.visionfy == True: #detected message is published if robot can see intruder and it is in acceptable proximity
+        if dist < thresh and self.visionfy == True: #intruder's transform is published if robot can see intruder and it is in acceptable proximity
             det_msg = String()
             det_msg.data = 'Detected'
             #self.detpub.publish(det_msg)
