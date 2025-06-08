@@ -15,6 +15,12 @@ import message_filters
 # import numpy as np
 # import tensorflow as tf
 
+# FUNCTION INPUTS and OUTPUTS: 
+# Input to the synced_callback function is RGB and depth image messages from the camera. The topics are '/camera/color/image_raw'
+#  and '/camera/depth/image_raw'.
+# The output is the 3D position of the detected predator in the camera frame, if a predator is detected, as well as a bool telling if it's a predator.
+# The output is in the form of (x, y, z, is_predator) where x, y, z are the 3D coordinates in meters and is_predator is a boolean.
+
 # Parameters
 IMG_SIZE = (64, 64)  # Resize images as needed
 BATCH_SIZE = 32
@@ -228,8 +234,8 @@ class PredatorClassifierNode(Node):
 
         # self.get_logger().info("Predator classifier node started.")
         # Load model
-        self.model = tf.keras.models.load_model('predator_classifier_model_rodents_pred.h5')
-        self.get_logger().info("Predator classifier node started.")
+        self.model = tf.keras.models.load_model('best_predator_model_v2_1.h5')
+        
 
         # Sync RGB and depth messages
         self.rgb_sub = message_filters.Subscriber(self, Image, '/camera/color/image_raw')
@@ -239,6 +245,8 @@ class PredatorClassifierNode(Node):
         ts = message_filters.ApproximateTimeSynchronizer(
             [self.rgb_sub, self.depth_sub], queue_size=10, slop=0.1)
         ts.registerCallback(self.synced_callback)
+        
+        self.get_logger().info("Predator classifier node started.")
 
     def preprocess(self, cv_image):
         # Resize, normalize etc.
@@ -271,6 +279,10 @@ class PredatorClassifierNode(Node):
         return cx, cy
     
     def synced_callback(self, rgb_msg, depth_msg):
+        
+        self.get_logger().info("synced_callback triggered")
+
+        
         try:
             cv_rgb = self.bridge.imgmsg_to_cv2(rgb_msg, desired_encoding='bgr8')
             cv_rgb = cv2.cvtColor(cv_rgb, cv2.COLOR_BGR2RGB)
@@ -285,6 +297,8 @@ class PredatorClassifierNode(Node):
         pred = self.model.predict(input_img)
         prob = pred[0][0]
         is_predator = prob > 0.5
+        
+        self.get_logger().info(f'is_predator: {is_predator}, prob: {prob:.2f}')
 
         if is_predator:
             cx, cy = self.estimate_intruder_position(cv_rgb)
@@ -301,7 +315,7 @@ class PredatorClassifierNode(Node):
             # Estimate 3D position from depth
             x, y, z = self.project_to_3d(cx, cy, depth)
             self.get_logger().info(f"Predator at image ({cx}, {cy}), 3D position (x={x:.2f}, y={y:.2f}, z={z:.2f}) prob={prob:.2f}")
-            return x, y, z
+            return x, y, z, is_predator
         else:
             self.get_logger().info(f"Not Predator (prob={prob:.2f})")
 
